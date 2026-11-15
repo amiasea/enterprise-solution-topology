@@ -1,3 +1,4 @@
+
 name: Validate topology
 
 on:
@@ -36,8 +37,7 @@ jobs:
         run: |
           $key = az keyvault secret show `
             --id "${{ vars.AMIASEA_GITHUB_APP_PEM_FILE_VERSIONLESS_ID }}" `
-            --query value `
-            --output tsv
+            --query value --output tsv
 
           if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($key)) {
             throw "GitHub App private key was not retrieved."
@@ -53,170 +53,56 @@ jobs:
 
       - name: Create GitHub App installation token
         id: app-token
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@v3.3.0
         with:
-          app-id: ${{ vars.AMIASEA_GITHUB_APP_ID }}
+          client-id: ${{ vars.AMIASEA_GITHUB_APP_CLIENT_ID }}
           private-key: ${{ steps.github-app-key.outputs.private-key }}
           owner: amiasea-enterprise-orchard
           permission-contents: read
           permission-metadata: read
 
       - name: Validate topology
+        id: topology
         shell: pwsh
         env:
-          GITHUB_APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $headers = @{
-            Accept = 'application/vnd.github+json'
-            Authorization = "Bearer $env:GITHUB_APP_TOKEN"
-            'X-GitHub-Api-Version' = '2026-03-10'
-          }
-
-          function Invoke-GitHubApi {
-            param([Parameter(Mandatory)][string]$Uri)
-
-            Invoke-RestMethod -Method Get -Uri $Uri -Headers $headers
-          }
-
-          function Resolve-GitHubRepository {
-            param([Parameter(Mandatory)][string]$Url)
-
-            $resolvedUrl = $Url.Trim()
-
-            # Resolve relative submodule URLs against this topology repository.
-            if ($resolvedUrl -match '^(\.\.?/)') {
-              $repositoryParts = $env:GITHUB_REPOSITORY.Split('/')
-              $baseUrl = [uri]"https://github.com/$($repositoryParts[0])/$($repositoryParts[1])/"
-              $resolvedUrl = ([uri]::new($baseUrl, $resolvedUrl)).AbsoluteUri
-            }
-
-            $resolvedUrl = $resolvedUrl.TrimEnd('/')
-            $resolvedUrl = $resolvedUrl -replace '\.git$', ''
-
-            if ($resolvedUrl -match '^https://github\.com/([^/]+)/([^/]+)$' -or
-                $resolvedUrl -match '^ssh://git@github\.com/([^/]+)/([^/]+)$' -or
-                $resolvedUrl -match '^git@github\.com:([^/]+)/([^/]+)$') {
-              return [pscustomobject]@{
-                Owner = $Matches[1]
-                Repo  = $Matches[2]
-              }
-            }
-
-            throw "Unsupported submodule URL '$Url'. Expected a GitHub HTTPS or SSH repository URL."
-          }
-
-          function Get-RepositoryTagRefs {
-            param(
-              [Parameter(Mandatory)][string]$Owner,
-              [Parameter(Mandatory)][string]$Repo
-            )
-
-            $refs = [System.Collections.Generic.List[object]]::new()
-
-            for ($page = 1; ; $page++) {
-              $uri = "https://api.github.com/repos/$Owner/$Repo/git/matching-refs/tags/?per_page=100&page=$page"
-              $pageRefs = @(Invoke-GitHubApi -Uri $uri)
-
-              if ($pageRefs.Count -eq 0) {
-                break
-              }
-
-              foreach ($ref in $pageRefs) {
-                $refs.Add($ref)
-              }
-
-              if ($pageRefs.Count -lt 100) {
-                break
-              }
-            }
-
-            return $refs.ToArray()
-          }
-
-          function Resolve-TagCommit {
-            param(
-              [Parameter(Mandatory)]$TagRef,
-              [Parameter(Mandatory)][string]$Owner,
-              [Parameter(Mandatory)][string]$Repo
-            )
-
-            $gitObject = $TagRef.object
-            $seen = @{}
-
-            # Annotated tags point to tag objects; peel them until reaching
-            # the underlying commit.
-            while ($gitObject.type -eq 'tag') {
-              if ($seen.ContainsKey($gitObject.sha)) {
-                throw "Cyclic annotated tag reference detected in $Owner/$Repo."
-              }
-
-              $seen[$gitObject.sha] = $true
-
-              $tagObject = Invoke-GitHubApi `
-                -Uri "https://api.github.com/repos/$Owner/$Repo/git/tags/$($gitObject.sha)"
-
-              $gitObject = $tagObject.object
-            }
-
-            if ($gitObject.type -eq 'commit') {
-              return $gitObject.sha
-            }
-
-            return $null
-          }
-
-          # Require .gitmodules to exist in the proposed commit, not merely
-          # in the runner's working directory.
+          # Require committed .gitmodules.
           git cat-file -e 'HEAD:.gitmodules'
           if ($LASTEXITCODE -ne 0) {
             throw "The topology must contain a committed .gitmodules file."
           }
 
-          # Read submodule declarations from Git's own config parser.
-          $configLines = @(git config --file .gitmodules --list)
-          if ($LASTEXITCODE -ne 0) {
-            throw "Unable to parse .gitmodules."
-          }
-
+          # Parse submodule declarations.
           $modules = @{}
 
-          foreach ($line in $configLines) {
-            $separator = $line.IndexOf('=')
-            if ($separator -lt 0) {
-              continue
-            }
-
-            $key = $line.Substring(0, $separator)
-            $value = $line.Substring($separator + 1)
+          foreach ($line in (git config --file .gitmodules --list)) {
+            $key, $value = $line -split '=', 2
 
             if ($key -match '^submodule\.(.+)\.(path|url)$') {
-              $moduleName = $Matches[1]
-              $property = $Matches[2]
+              $name, $property = $Matches[1], $Matches[2]
 
-              if (-not $modules.ContainsKey($moduleName)) {
-                $modules[$moduleName] = @{}
+              if (-not $modules.ContainsKey($name)) {
+                $modules[$name] = @{}
               }
 
-              if ($modules[$moduleName].ContainsKey($property)) {
-                throw "Duplicate '$property' declaration for submodule '$moduleName'."
+              if ($modules[$name].ContainsKey($property)) {
+                throw "Duplicate '$property' declaration for submodule '$name'."
               }
 
-              $modules[$moduleName][$property] = $value
+              $modules[$name][$property] = $value
             }
           }
 
           $modulesByPath = @{}
 
-          foreach ($moduleName in $modules.Keys) {
-            $module = $modules[$moduleName]
+          foreach ($name in $modules.Keys) {
+            $module = $modules[$name]
 
-            if (-not $module.ContainsKey('path') -or
-                -not $module.ContainsKey('url') -or
-                [string]::IsNullOrWhiteSpace($module.path) -or
-                [string]::IsNullOrWhiteSpace($module.url)) {
-              throw "Submodule '$moduleName' must declare both path and url."
+            if (-not $module.path -or -not $module.url) {
+              throw "Submodule '$name' must declare both path and url."
             }
 
             if ($modulesByPath.ContainsKey($module.path)) {
@@ -226,29 +112,20 @@ jobs:
             $modulesByPath[$module.path] = $module
           }
 
-          # Enumerate Gitlinks from the proposed commit.
-          $treeLines = @(git ls-tree -r HEAD)
+          # Enumerate Gitlinks.
+          $gitlinks = @{}
+
+          foreach ($line in (git ls-tree -r HEAD)) {
+            if ($line -match '^160000 commit ([0-9a-f]{40,64})\t(.+)$') {
+              $gitlinks[$Matches[2]] = $Matches[1]
+            }
+          }
+
           if ($LASTEXITCODE -ne 0) {
             throw "Unable to inspect the proposed topology tree."
           }
 
-          $gitlinks = @{}
-
-          foreach ($line in $treeLines) {
-            if ($line -match '^160000 commit ([0-9a-f]{40,64})\t(.+)$') {
-              $commit = $Matches[1]
-              $path = $Matches[2]
-
-              if ($gitlinks.ContainsKey($path)) {
-                throw "Duplicate Gitlink path '$path'."
-              }
-
-              $gitlinks[$path] = $commit
-            }
-          }
-
-          # Require a one-to-one correspondence between .gitmodules
-          # declarations and Gitlinks.
+          # Require one-to-one correspondence.
           foreach ($path in $modulesByPath.Keys) {
             if (-not $gitlinks.ContainsKey($path)) {
               throw ".gitmodules declares '$path', but no corresponding Gitlink exists."
@@ -263,89 +140,143 @@ jobs:
 
           Write-Host "Topology structure is valid. Found $($gitlinks.Count) component Gitlink(s)."
 
-          # SemVer 2.0.0, allowing the conventional optional 'v' prefix.
-          $semVerPattern = '^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$'
-
+          # Resolve component repositories and commits.
+          $components = @{}
           $tagCache = @{}
-          $validatedComponents = 0
 
           foreach ($path in ($gitlinks.Keys | Sort-Object)) {
-            $module = $modulesByPath[$path]
-            $repository = Resolve-GitHubRepository -Url $module.url
+            $url = $modulesByPath[$path].url.Trim()
 
-            $owner = $repository.Owner
-            $repo = $repository.Repo
+            # Resolve relative submodule URLs.
+            if ($url -match '^(\.\.?/)') {
+              $owner, $topologyRepo = $env:GITHUB_REPOSITORY.Split('/')
+              $url = ([uri]::new(
+                [uri]"https://github.com/$owner/$topologyRepo/",
+                $url
+              )).AbsoluteUri
+            }
+
+            $url = $url.TrimEnd('/') -replace '\.git$', ''
+
+            if ($url -notmatch '^(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)([^/]+)/([^/]+)$') {
+              throw "Unsupported submodule URL '$url'."
+            }
+
+            $repository = "$($Matches[1])/$($Matches[2])"
             $commit = $gitlinks[$path]
-            $repositoryKey = "$owner/$repo"
 
-            Write-Host "Validating $path -> $repositoryKey@$commit"
+            Write-Host "Resolving tags for $path -> ${repository}@$commit"
 
-            if (-not $tagCache.ContainsKey($repositoryKey)) {
-              $tagCache[$repositoryKey] = @(
-                Get-RepositoryTagRefs -Owner $owner -Repo $repo
-              )
+            # Retrieve and cache all tag references.
+            if (-not $tagCache.ContainsKey($repository)) {
+              $output = gh api --paginate --slurp `
+                "repos/$repository/git/matching-refs/tags/?per_page=100"
+
+              if ($LASTEXITCODE -ne 0) {
+                throw "Unable to retrieve tags for '$repository'."
+              }
+
+              $tagCache[$repository] = @(($output -join "`n") |
+                ConvertFrom-Json -AsHashtable -NoEnumerate |
+                ForEach-Object { $_ })
             }
 
-            $matureTags = @()
+            $matchingTags = @()
 
-            foreach ($tagRef in $tagCache[$repositoryKey]) {
-              if ($tagRef.ref -notmatch '^refs/tags/(.+)$') {
+            foreach ($tag in $tagCache[$repository]) {
+              $tagName = $tag.ref -replace '^refs/tags/', ''
+
+              if ($tagName -eq $tag.ref) {
                 continue
               }
 
-              $tagName = $Matches[1]
+              # Peel annotated tags to their target commit.
+              $object = $tag.object
+              $seen = @{}
 
-              if ($tagName -notmatch $semVerPattern) {
-                continue
-              }
-
-              $tagCommit = Resolve-TagCommit `
-                -TagRef $tagRef `
-                -Owner $owner `
-                -Repo $repo
-
-              if ($tagCommit -eq $commit) {
-                $matureTags += $tagName
-              }
-            }
-
-            if ($matureTags.Count -eq 0) {
-              throw "Component '$path' has no SemVer tag pointing to selected commit $commit."
-            }
-
-            # Every SemVer tag pointing to the selected commit must have
-            # a corresponding published immutable GitHub Release.
-            foreach ($tagName in $matureTags) {
-              $encodedTag = [uri]::EscapeDataString($tagName)
-              $releaseUri = "https://api.github.com/repos/$owner/$repo/releases/tags/$encodedTag"
-
-              try {
-                $release = Invoke-GitHubApi -Uri $releaseUri
-              }
-              catch {
-                $statusCode = 0
-
-                if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
-                  $statusCode = [int]$_.Exception.Response.StatusCode
+              while ($object.type -eq 'tag') {
+                if ($seen.ContainsKey($object.sha)) {
+                  throw "Cyclic annotated tag reference in '$repository'."
                 }
 
-                if ($statusCode -eq 404) {
-                  throw "Component '$path' has SemVer tag '$tagName' but no corresponding GitHub Release."
+                $seen[$object.sha] = $true
+
+                $tagObject = gh api "repos/$repository/git/tags/$($object.sha)"
+
+                if ($LASTEXITCODE -ne 0) {
+                  throw "Unable to resolve tag '$tagName' in '$repository'."
                 }
 
-                throw "Unable to verify release '$tagName' for '$repositoryKey': $($_.Exception.Message)"
+                $object = ($tagObject | ConvertFrom-Json -AsHashtable).object
               }
 
-              if ($release.tag_name -ne $tagName -or
-                  $release.draft -ne $false -or
-                  $release.immutable -ne $true) {
-                throw "Release '$tagName' for '$repositoryKey' is not a published immutable release."
+              if ($object.type -eq 'commit' -and $object.sha -eq $commit) {
+                $matchingTags += $tagName
               }
-
-              Write-Host "  Validated immutable release: $tagName"
             }
 
-            $validatedComponents++
+            $components[$path] = @{
+              repository = $repository
+              commit     = $commit
+              tags       = @($matchingTags)
+            }
+
+            Write-Host "  Found $($matchingTags.Count) matching tag(s)."
           }
 
-          Write-Host "Topology validation succeeded. Validated $validatedComponents component(s)."
+          $json = ConvertTo-Json -InputObject $components -Depth 10 -Compress
+          "components=$json" >> $env:GITHUB_OUTPUT
+
+      - name: Validate immutable releases
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          COMPONENTS: ${{ steps.topology.outputs.components }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $components = $env:COMPONENTS | ConvertFrom-Json -AsHashtable
+          $validated = 0
+
+          foreach ($path in ($components.Keys | Sort-Object)) {
+            $component = $components[$path]
+            $repository = $component.repository
+            $commit = $component.commit
+            $mature = $false
+
+            Write-Host "Validating releases for $path -> ${repository}@$commit"
+
+            foreach ($tagName in $component.tags) {
+              $output = gh release view $tagName `
+                --repo $repository `
+                --json tagName,isDraft,isImmutable 2>&1
+
+              if ($LASTEXITCODE -ne 0) {
+                $errorText = $output -join "`n"
+
+                if ($errorText -match 'HTTP 404|Not Found|release not found') {
+                  continue
+                }
+
+                throw "Unable to inspect release '$tagName' in '$repository': $errorText"
+              }
+
+              $release = ($output -join "`n") | ConvertFrom-Json -AsHashtable
+
+              if ($release.tagName -eq $tagName -and
+                  $release.isDraft -eq $false -and
+                  $release.isImmutable -eq $true) {
+                Write-Host "  Validated immutable release: $tagName"
+                $mature = $true
+                break
+              }
+            }
+
+            if (-not $mature) {
+              throw "Component '$path' has no immutable release pointing to selected commit $commit."
+            }
+
+            $validated++
+          }
+
+          Write-Host "Topology validation succeeded. Validated $validated component(s)."
