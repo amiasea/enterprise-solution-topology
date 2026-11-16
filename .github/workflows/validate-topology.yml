@@ -24,10 +24,18 @@ jobs:
           submodules: false
           persist-credentials: false
 
+      - name: Install YAML parser
+        shell: pwsh
+        run: |
+          Install-Module powershell-yaml `
+            -RequiredVersion 0.4.12 `
+            -Scope CurrentUser `
+            -Force
+
       - name: Azure login
         uses: azure/login@v2
         with:
-          client-id: ${{ vars.AZURE_ORCHARD_CLIENT_ID }}
+          client-id: ${{ vars.AZURE_INSTITUTIVE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_INSTITUTIVE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_INSTITUTIVE_SUBSCRIPTION_ID }}
 
@@ -62,221 +70,93 @@ jobs:
           permission-metadata: read
 
       - name: Validate topology
-        id: topology
         shell: pwsh
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           $ErrorActionPreference = 'Stop'
 
-          # Require committed .gitmodules.
-          git cat-file -e 'HEAD:.gitmodules'
-          if ($LASTEXITCODE -ne 0) {
-            throw "The topology must contain a committed .gitmodules file."
+          Import-Module powershell-yaml
+
+          $manifestPath = 'solution-ontology.yml'
+
+          if (-not (Test-Path $manifestPath -PathType Leaf)) {
+            throw "Required solution ontology file '$manifestPath' was not found."
           }
 
-          # Parse submodule declarations.
-          $modules = @{}
+          # Parse the solution ontology.
+          $ontology = Get-Content $manifestPath -Raw | ConvertFrom-Yaml -Ordered
 
-          foreach ($line in (git config --file .gitmodules --list)) {
-            $key, $value = $line -split '=', 2
-
-            if ($key -match '^submodule\.(.+)\.(path|url)$') {
-              $name, $property = $Matches[1], $Matches[2]
-
-              if (-not $modules.ContainsKey($name)) {
-                $modules[$name] = @{}
-              }
-
-              if ($modules[$name].ContainsKey($property)) {
-                throw "Duplicate '$property' declaration for submodule '$name'."
-              }
-
-              $modules[$name][$property] = $value
-            }
+          if ($ontology -isnot [System.Collections.IDictionary]) {
+            throw "The solution ontology must contain a YAML mapping."
           }
 
-          $modulesByPath = @{}
-
-          foreach ($name in $modules.Keys) {
-            $module = $modules[$name]
-
-            if (-not $module.path -or -not $module.url) {
-              throw "Submodule '$name' must declare both path and url."
-            }
-
-            if ($modulesByPath.ContainsKey($module.path)) {
-              throw "Multiple submodules declare path '$($module.path)'."
-            }
-
-            $modulesByPath[$module.path] = $module
+          if ([string]::IsNullOrWhiteSpace([string]$ontology['name'])) {
+            throw "The solution ontology must declare a name."
           }
 
-          # Enumerate Gitlinks.
-          $gitlinks = @{}
+          $components = $ontology['components']
 
-          foreach ($line in (git ls-tree -r HEAD)) {
-            if ($line -match '^160000 commit ([0-9a-f]{40,64})\t(.+)$') {
-              $gitlinks[$Matches[2]] = $Matches[1]
-            }
+          if ($components -isnot [System.Collections.IDictionary] -or
+              $components.Count -eq 0) {
+            throw "The solution ontology must declare at least one component."
           }
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Unable to inspect the proposed topology tree."
-          }
+          Write-Host "Validating solution ontology: $($ontology['name'])"
 
-          # Require one-to-one correspondence.
-          foreach ($path in $modulesByPath.Keys) {
-            if (-not $gitlinks.ContainsKey($path)) {
-              throw ".gitmodules declares '$path', but no corresponding Gitlink exists."
-            }
-          }
-
-          foreach ($path in $gitlinks.Keys) {
-            if (-not $modulesByPath.ContainsKey($path)) {
-              throw "Gitlink '$path' has no corresponding .gitmodules declaration."
-            }
-          }
-
-          Write-Host "Topology structure is valid. Found $($gitlinks.Count) component Gitlink(s)."
-
-          # Resolve component repositories and commits.
-          $components = @{}
-          $tagCache = @{}
-
-          foreach ($path in ($gitlinks.Keys | Sort-Object)) {
-            $url = $modulesByPath[$path].url.Trim()
-
-            # Resolve relative submodule URLs.
-            if ($url -match '^(\.\.?/)') {
-              $owner, $topologyRepo = $env:GITHUB_REPOSITORY.Split('/')
-              $url = ([uri]::new(
-                [uri]"https://github.com/$owner/$topologyRepo/",
-                $url
-              )).AbsoluteUri
-            }
-
-            $url = $url.TrimEnd('/') -replace '\.git$', ''
-
-            if ($url -notmatch '^(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)([^/]+)/([^/]+)$') {
-              throw "Unsupported submodule URL '$url'."
-            }
-
-            $repository = "$($Matches[1])/$($Matches[2])"
-            $commit = $gitlinks[$path]
-
-            Write-Host "Resolving tags for $path -> ${repository}@$commit"
-
-            # Retrieve and cache all tag references.
-            if (-not $tagCache.ContainsKey($repository)) {
-              $output = gh api --paginate --slurp `
-                "repos/$repository/git/matching-refs/tags/?per_page=100"
-
-              if ($LASTEXITCODE -ne 0) {
-                throw "Unable to retrieve tags for '$repository'."
-              }
-
-              $tagCache[$repository] = @(($output -join "`n") |
-                ConvertFrom-Json -AsHashtable -NoEnumerate |
-                ForEach-Object { $_ })
-            }
-
-            $matchingTags = @()
-
-            foreach ($tag in $tagCache[$repository]) {
-              $tagName = $tag.ref -replace '^refs/tags/', ''
-
-              if ($tagName -eq $tag.ref) {
-                continue
-              }
-
-              # Peel annotated tags to their target commit.
-              $object = $tag.object
-              $seen = @{}
-
-              while ($object.type -eq 'tag') {
-                if ($seen.ContainsKey($object.sha)) {
-                  throw "Cyclic annotated tag reference in '$repository'."
-                }
-
-                $seen[$object.sha] = $true
-
-                $tagObject = gh api "repos/$repository/git/tags/$($object.sha)"
-
-                if ($LASTEXITCODE -ne 0) {
-                  throw "Unable to resolve tag '$tagName' in '$repository'."
-                }
-
-                $object = ($tagObject | ConvertFrom-Json -AsHashtable).object
-              }
-
-              if ($object.type -eq 'commit' -and $object.sha -eq $commit) {
-                $matchingTags += $tagName
-              }
-            }
-
-            $components[$path] = @{
-              repository = $repository
-              commit     = $commit
-              tags       = @($matchingTags)
-            }
-
-            Write-Host "  Found $($matchingTags.Count) matching tag(s)."
-          }
-
-          $json = ConvertTo-Json -InputObject $components -Depth 10 -Compress
-          "components=$json" >> $env:GITHUB_OUTPUT
-
-      - name: Validate immutable releases
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          COMPONENTS: ${{ steps.topology.outputs.components }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          $components = $env:COMPONENTS | ConvertFrom-Json -AsHashtable
           $validated = 0
 
           foreach ($path in ($components.Keys | Sort-Object)) {
             $component = $components[$path]
-            $repository = $component.repository
-            $commit = $component.commit
-            $mature = $false
 
-            Write-Host "Validating releases for $path -> ${repository}@$commit"
-
-            foreach ($tagName in $component.tags) {
-              $output = gh release view $tagName `
-                --repo $repository `
-                --json tagName,isDraft,isImmutable 2>&1
-
-              if ($LASTEXITCODE -ne 0) {
-                $errorText = $output -join "`n"
-
-                if ($errorText -match 'HTTP 404|Not Found|release not found') {
-                  continue
-                }
-
-                throw "Unable to inspect release '$tagName' in '$repository': $errorText"
-              }
-
-              $release = ($output -join "`n") | ConvertFrom-Json -AsHashtable
-
-              if ($release.tagName -eq $tagName -and
-                  $release.isDraft -eq $false -and
-                  $release.isImmutable -eq $true) {
-                Write-Host "  Validated immutable release: $tagName"
-                $mature = $true
-                break
-              }
+            if ($component -isnot [System.Collections.IDictionary]) {
+              throw "Component '$path' must contain a mapping."
             }
 
-            if (-not $mature) {
-              throw "Component '$path' has no immutable release pointing to selected commit $commit."
+            $repository = [string]$component['repository']
+            $version = [string]$component['releases']
+
+            if ($repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
+              throw "Component '$path' has an invalid repository identifier: '$repository'."
             }
+
+            if ([string]::IsNullOrWhiteSpace($version)) {
+              throw "Component '$path' must declare a release version."
+            }
+
+            # The manifest stores the version without the v-prefix.
+            $tagName = "v$version"
+
+            Write-Host ""
+            Write-Host "Validating $path -> $repository@$tagName"
+
+            $output = gh release view $tagName `
+              --repo $repository `
+              --json tagName,isDraft,isImmutable 2>&1
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Unable to retrieve release '$tagName' from '$repository': $($output -join "`n")"
+            }
+
+            $release = ($output -join "`n") | ConvertFrom-Json -AsHashtable
+
+            if ($release.tagName -cne $tagName) {
+              throw "The retrieved release tag does not match '$tagName' in '$repository'."
+            }
+
+            if ($release.isDraft -ne $false) {
+              throw "Release '$tagName' in '$repository' is not published."
+            }
+
+            if ($release.isImmutable -ne $true) {
+              throw "Release '$tagName' in '$repository' is not immutable."
+            }
+
+            Write-Host "  Validated immutable release: $tagName"
 
             $validated++
           }
 
-          Write-Host "Topology validation succeeded. Validated $validated component(s)."
+          Write-Host ""
+          Write-Host "Topology validation succeeded."
+          Write-Host "Validated $validated component(s)."
