@@ -1,0 +1,80 @@
+
+name: Publish Solution Topology
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - solution_topology.yml
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: solution-topology-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish Solution Topology
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.SOLUTION_TOPOLOGY_PUBLISHER_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Install YAML parser
+        run: pip install PyYAML
+
+      - name: Copy solution packages
+        shell: bash
+        env:
+          DOMAIN: ${{ vars.AWS_CODEARTIFACT_DOMAIN }}
+          DOMAIN_OWNER: ${{ vars.AWS_ACCOUNT_ID }}
+          REGION: ${{ vars.AWS_REGION }}
+          SOURCE_REPOSITORY: orchard
+          DESTINATION_REPOSITORY: solution-topology
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import yaml
+
+          with open("solution_topology.yml", encoding="utf-8") as file:
+              topology = yaml.safe_load(file)
+
+          for classification, components in topology.items():
+              if classification == "name":
+                  continue
+
+              for component in components:
+                  package = component["package"]
+                  version = str(component["version"])
+
+                  print(
+                      f"Copying {classification}/{package}@{version}"
+                  )
+
+                  subprocess.run([
+                      "aws", "codeartifact", "copy-package-versions",
+                      "--domain", os.environ["DOMAIN"],
+                      "--domain-owner", os.environ["DOMAIN_OWNER"],
+                      "--region", os.environ["REGION"],
+                      "--source-repository",
+                      os.environ["SOURCE_REPOSITORY"],
+                      "--destination-repository",
+                      os.environ["DESTINATION_REPOSITORY"],
+                      "--format", "generic",
+                      "--namespace", classification,
+                      "--package", package,
+                      "--versions", version
+                  ], check=True)
+          PY
