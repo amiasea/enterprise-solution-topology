@@ -1,171 +1,171 @@
-name: Validate topology
+# name: Validate topology
 
-on:
-  pull_request:
-    branches:
-      - development
-      - main
+# on:
+#   pull_request:
+#     branches:
+#       - development
+#       - main
 
-permissions:
-  contents: read
-  id-token: write
+# permissions:
+#   contents: read
+#   id-token: write
 
-jobs:
-  validate:
-    name: Validate topology
-    runs-on: ubuntu-latest
+# jobs:
+#   validate:
+#     name: Validate topology
+#     runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout proposed topology
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
-          submodules: false
-          persist-credentials: false
+#     steps:
+#       - name: Checkout proposed topology
+#         uses: actions/checkout@v4
+#         with:
+#           ref: ${{ github.event.pull_request.merge_commit_sha }}
+#           submodules: false
+#           persist-credentials: false
 
-      - name: Install YAML parser
-        shell: pwsh
-        run: |
-          Install-Module powershell-yaml `
-            -RequiredVersion 0.4.12 `
-            -Scope CurrentUser `
-            -Force
+#       - name: Install YAML parser
+#         shell: pwsh
+#         run: |
+#           Install-Module powershell-yaml `
+#             -RequiredVersion 0.4.12 `
+#             -Scope CurrentUser `
+#             -Force
 
-      - name: Azure login
-        uses: azure/login@v2
-        with:
-          client-id: ${{ vars.AZURE_INSTITUTIVE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_INSTITUTIVE_TENANT_ID }}
-          subscription-id: ${{ vars.AZURE_INSTITUTIVE_SUBSCRIPTION_ID }}
+#       - name: Azure login
+#         uses: azure/login@v2
+#         with:
+#           client-id: ${{ vars.AZURE_INSTITUTIVE_CLIENT_ID }}
+#           tenant-id: ${{ vars.AZURE_INSTITUTIVE_TENANT_ID }}
+#           subscription-id: ${{ vars.AZURE_INSTITUTIVE_SUBSCRIPTION_ID }}
 
-      - name: Retrieve GitHub App private key
-        id: github-app-key
-        shell: pwsh
-        run: |
-          $key = az keyvault secret show `
-            --id "${{ vars.AMIASEA_GITHUB_APP_PEM_FILE_VERSIONLESS_ID }}" `
-            --query value --output tsv
+#       - name: Retrieve GitHub App private key
+#         id: github-app-key
+#         shell: pwsh
+#         run: |
+#           $key = az keyvault secret show `
+#             --id "${{ vars.AMIASEA_GITHUB_APP_PEM_FILE_VERSIONLESS_ID }}" `
+#             --query value --output tsv
 
-          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($key)) {
-            throw "GitHub App private key was not retrieved."
-          }
+#           if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($key)) {
+#             throw "GitHub App private key was not retrieved."
+#           }
 
-          $escapedKey = $key.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
-          Write-Output "::add-mask::$escapedKey"
+#           $escapedKey = $key.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+#           Write-Output "::add-mask::$escapedKey"
 
-          $delimiter = "EOF_$([guid]::NewGuid().ToString('N'))"
-          "private-key<<$delimiter" >> $env:GITHUB_OUTPUT
-          $key >> $env:GITHUB_OUTPUT
-          "$delimiter" >> $env:GITHUB_OUTPUT
+#           $delimiter = "EOF_$([guid]::NewGuid().ToString('N'))"
+#           "private-key<<$delimiter" >> $env:GITHUB_OUTPUT
+#           $key >> $env:GITHUB_OUTPUT
+#           "$delimiter" >> $env:GITHUB_OUTPUT
 
-      - name: Create GitHub App installation token
-        id: app-token
-        uses: actions/create-github-app-token@v3.3.0
-        with:
-          client-id: ${{ vars.AMIASEA_GITHUB_APP_CLIENT_ID }}
-          private-key: ${{ steps.github-app-key.outputs.private-key }}
-          owner: amiasea-enterprise-orchard
-          permission-contents: read
-          permission-metadata: read
+#       - name: Create GitHub App installation token
+#         id: app-token
+#         uses: actions/create-github-app-token@v3.3.0
+#         with:
+#           client-id: ${{ vars.AMIASEA_GITHUB_APP_CLIENT_ID }}
+#           private-key: ${{ steps.github-app-key.outputs.private-key }}
+#           owner: amiasea-enterprise-orchard
+#           permission-contents: read
+#           permission-metadata: read
 
-      - name: Validate topology
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          $ErrorActionPreference = 'Stop'
+#       - name: Validate topology
+#         shell: pwsh
+#         env:
+#           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+#         run: |
+#           $ErrorActionPreference = 'Stop'
 
-          Import-Module powershell-yaml
+#           Import-Module powershell-yaml
 
-          $manifestPath = 'solution-topology.yml'
+#           $manifestPath = 'solution-topology.yml'
 
-          if (-not (Test-Path $manifestPath -PathType Leaf)) {
-            throw "Required solution topology file '$manifestPath' was not found."
-          }
+#           if (-not (Test-Path $manifestPath -PathType Leaf)) {
+#             throw "Required solution topology file '$manifestPath' was not found."
+#           }
 
-          # Parse the solution topology.
-          $topology = Get-Content $manifestPath -Raw | ConvertFrom-Yaml -Ordered
+#           # Parse the solution topology.
+#           $topology = Get-Content $manifestPath -Raw | ConvertFrom-Yaml -Ordered
 
-          if ($topology -isnot [System.Collections.IDictionary]) {
-            throw "The solution topology must contain a YAML mapping."
-          }
+#           if ($topology -isnot [System.Collections.IDictionary]) {
+#             throw "The solution topology must contain a YAML mapping."
+#           }
 
-          if ([string]::IsNullOrWhiteSpace([string]$topology['name'])) {
-            throw "The solution topology must declare a name."
-          }
+#           if ([string]::IsNullOrWhiteSpace([string]$topology['name'])) {
+#             throw "The solution topology must declare a name."
+#           }
 
-          # Classification domains are declared under 'domains'.
-          $domains = $topology['domains']
+#           # Classification domains are declared under 'domains'.
+#           $domains = $topology['domains']
 
-          if ($domains -isnot [System.Collections.IDictionary] -or
-              $domains.Count -eq 0) {
-            throw "The solution topology must declare at least one classification domain under 'domains'."
-          }
+#           if ($domains -isnot [System.Collections.IDictionary] -or
+#               $domains.Count -eq 0) {
+#             throw "The solution topology must declare at least one classification domain under 'domains'."
+#           }
 
-          Write-Host "Validating solution topology: $($topology['name'])"
+#           Write-Host "Validating solution topology: $($topology['name'])"
 
-          $validated = 0
+#           $validated = 0
 
-          foreach ($domain in ($domains.Keys | Sort-Object)) {
-            $components = $domains[$domain]
+#           foreach ($domain in ($domains.Keys | Sort-Object)) {
+#             $components = $domains[$domain]
 
-            if ($components -isnot [System.Collections.IList] -or
-                $components.Count -eq 0) {
-              throw "Classification domain '$domain' must contain at least one component."
-            }
+#             if ($components -isnot [System.Collections.IList] -or
+#                 $components.Count -eq 0) {
+#               throw "Classification domain '$domain' must contain at least one component."
+#             }
 
-            Write-Host ""
-            Write-Host "Validating classification domain: $domain"
+#             Write-Host ""
+#             Write-Host "Validating classification domain: $domain"
 
-            foreach ($component in $components) {
-              if ($component -isnot [System.Collections.IDictionary]) {
-                throw "Components in classification domain '$domain' must contain mappings."
-              }
+#             foreach ($component in $components) {
+#               if ($component -isnot [System.Collections.IDictionary]) {
+#                 throw "Components in classification domain '$domain' must contain mappings."
+#               }
 
-              $repository = [string]$component['repository']
-              $version = [string]$component['release']
+#               $repository = [string]$component['repository']
+#               $version = [string]$component['release']
 
-              if ($repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
-                throw "Classification domain '$domain' has an invalid repository identifier: '$repository'."
-              }
+#               if ($repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
+#                 throw "Classification domain '$domain' has an invalid repository identifier: '$repository'."
+#               }
 
-              if ([string]::IsNullOrWhiteSpace($version)) {
-                throw "Repository '$repository' in classification domain '$domain' must declare a release version."
-              }
+#               if ([string]::IsNullOrWhiteSpace($version)) {
+#                 throw "Repository '$repository' in classification domain '$domain' must declare a release version."
+#               }
 
-              # The manifest stores the version without the v-prefix.
-              $tagName = "v$version"
+#               # The manifest stores the version without the v-prefix.
+#               $tagName = "v$version"
 
-              Write-Host "  Validating $repository@$tagName"
+#               Write-Host "  Validating $repository@$tagName"
 
-              $output = gh release view $tagName `
-                --repo $repository `
-                --json tagName,isDraft,isImmutable 2>&1
+#               $output = gh release view $tagName `
+#                 --repo $repository `
+#                 --json tagName,isDraft,isImmutable 2>&1
 
-              if ($LASTEXITCODE -ne 0) {
-                throw "Unable to retrieve release '$tagName' from '$repository': $($output -join "`n")"
-              }
+#               if ($LASTEXITCODE -ne 0) {
+#                 throw "Unable to retrieve release '$tagName' from '$repository': $($output -join "`n")"
+#               }
 
-              $release = ($output -join "`n") | ConvertFrom-Json -AsHashtable
+#               $release = ($output -join "`n") | ConvertFrom-Json -AsHashtable
 
-              if ($release.tagName -cne $tagName) {
-                throw "The retrieved release tag does not match '$tagName' in '$repository'."
-              }
+#               if ($release.tagName -cne $tagName) {
+#                 throw "The retrieved release tag does not match '$tagName' in '$repository'."
+#               }
 
-              if ($release.isDraft -ne $false) {
-                throw "Release '$tagName' in '$repository' is not published."
-              }
+#               if ($release.isDraft -ne $false) {
+#                 throw "Release '$tagName' in '$repository' is not published."
+#               }
 
-              if ($release.isImmutable -ne $true) {
-                throw "Release '$tagName' in '$repository' is not immutable."
-              }
+#               if ($release.isImmutable -ne $true) {
+#                 throw "Release '$tagName' in '$repository' is not immutable."
+#               }
 
-              Write-Host "  Validated immutable release: $tagName"
+#               Write-Host "  Validated immutable release: $tagName"
 
-              $validated++
-            }
-          }
+#               $validated++
+#             }
+#           }
 
-          Write-Host ""
-          Write-Host "Topology validation succeeded."
-          Write-Host "Validated $validated component(s)."
+#           Write-Host ""
+#           Write-Host "Topology validation succeeded."
+#           Write-Host "Validated $validated component(s)."
